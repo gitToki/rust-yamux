@@ -1,3 +1,50 @@
+# 0.13.10
+
+- Fix panic when processing oversized inbound Data|SYN frames.
+  See [ac71745](https://github.com/libp2p/rust-yamux/commit/ac71745226b99191249bbbb0420aceba052c150c) 
+  and [GHSA-vxx9-2994-q338](https://github.com/libp2p/rust-yamux/security/advisories/GHSA-vxx9-2994-q338).
+
+# 0.13.9
+
+- Improve flow-control credit verification for window updates.
+  See [PR 221](https://github.com/libp2p/rust-yamux/pull/221).
+
+# 0.13.8
+
+- Introduce `WriteState::Poisoned` to avoid further reads after the returned number of bytes from a write operation is bigger than the header size.
+  See [PR 211](https://github.com/libp2p/rust-yamux/pull/211).
+
+# 0.13.7
+
+- Fix compilation on rust versions < 1.87.0.
+  See [PR 208](https://github.com/libp2p/rust-yamux/pull/208).
+
+# 0.13.6
+
+- Fix panic on frame io when the returned number of bytes from a write operation is bigger than the header size.
+  See [PR 202](https://github.com/libp2p/rust-yamux/pull/179).
+
+# 0.13.5
+
+- Fix possible poisoned connection when closing. See [PR 199](https://github.com/libp2p/rust-yamux/pull/199).
+
+# 0.13.4
+
+- Fix sending pending frames after closing. See [PR 194](https://github.com/libp2p/rust-yamux/pull/194).
+
+# 0.13.3
+
+- Wake up readers after setting the state to RecvClosed to not miss EOF.
+  See [PR 190](https://github.com/libp2p/rust-yamux/pull/190).
+
+- Use `web-time` instead of `instant`.
+  See [PR 191](https://github.com/libp2p/rust-yamux/pull/191).
+
+# 0.13.2
+
+- Bound `Active`'s `pending_frames` to enforce backpressure. 
+  See [460baf2](https://github.com/libp2p/rust-yamux/commit/460baf2ccb7d5982b266cb3cb9c0bdf75b4fb779)
+  
 # 0.13.1
 
 - Fix WASM support using `instant::{Duration, Instant}` instead of `std::time::{Duration, Instant}`.

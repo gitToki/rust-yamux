@@ -1,9 +1,9 @@
 use std::{cmp, sync::Arc};
 
-use instant::Instant;
 use parking_lot::Mutex;
+use web_time::Instant;
 
-use crate::{connection::rtt::Rtt, Config, DEFAULT_CREDIT};
+use crate::{connection::rtt::Rtt, Config, ConnectionError, DEFAULT_CREDIT};
 
 #[derive(Debug)]
 pub(crate) struct FlowController {
@@ -126,7 +126,7 @@ impl FlowController {
 
         self.assert_invariants(buffer_len);
 
-        return Some(next_window_update);
+        Some(next_window_update)
     }
 
     fn assert_invariants(&self, buffer_len: usize) {
@@ -169,29 +169,28 @@ impl FlowController {
         self.send_window
     }
 
-    pub(crate) fn consume_send_window(&mut self, i: u32) {
+    pub(crate) fn consume_send_window(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.send_window = self
             .send_window
             .checked_sub(i)
-            .expect("not exceed send window");
+            .ok_or(ConnectionError::InvalidWindowUpdate)?;
+        Ok(())
     }
 
-    pub(crate) fn increase_send_window_by(&mut self, i: u32) {
+    pub(crate) fn increase_send_window_by(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.send_window = self
             .send_window
             .checked_add(i)
-            .expect("send window not to exceed u32");
+            .ok_or(ConnectionError::InvalidWindowUpdate)?;
+        Ok(())
     }
 
-    pub(crate) fn receive_window(&self) -> u32 {
-        self.receive_window
-    }
-
-    pub(crate) fn consume_receive_window(&mut self, i: u32) {
+    pub(crate) fn consume_receive_window(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.receive_window = self
             .receive_window
             .checked_sub(i)
-            .expect("not exceed receive window");
+            .ok_or(ConnectionError::InvalidWindowUpdate)?;
+        Ok(())
     }
 }
 
@@ -212,8 +211,8 @@ impl Drop for FlowController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use instant::Duration;
     use quickcheck::{GenRange, QuickCheck};
+    use web_time::Duration;
 
     #[derive(Debug)]
     struct Input {
@@ -228,13 +227,10 @@ mod tests {
                 controller: FlowController {
                     config: self.controller.config.clone(),
                     accumulated_max_stream_windows: Arc::new(Mutex::new(
-                        self.controller
-                            .accumulated_max_stream_windows
-                            .lock()
-                            .clone(),
+                        *self.controller.accumulated_max_stream_windows.lock(),
                     )),
                     rtt: self.controller.rtt.clone(),
-                    last_window_update: self.controller.last_window_update.clone(),
+                    last_window_update: self.controller.last_window_update,
                     receive_window: self.controller.receive_window,
                     max_receive_window: self.controller.max_receive_window,
                     send_window: self.controller.send_window,

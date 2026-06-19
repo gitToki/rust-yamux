@@ -17,6 +17,8 @@ mod closing;
 mod rtt;
 mod stream;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::tagged_stream::TaggedStream;
 use crate::{
     error::ConnectionError,
@@ -37,6 +39,9 @@ use std::{fmt, sync::Arc, task::Poll};
 
 pub use stream::{Packet, State, Stream};
 
+/// Next connection identifier, used for debug logging.
+static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
 /// How the connection is used.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Mode {
@@ -48,14 +53,14 @@ pub enum Mode {
 
 /// The connection identifier.
 ///
-/// Randomly generated, this is mainly intended to improve log output.
+/// Sequentially generated, this is mainly intended to improve log output.
 #[derive(Clone, Copy)]
 pub(crate) struct Id(u32);
 
 impl Id {
-    /// Create a random connection ID.
-    pub(crate) fn random() -> Self {
-        Id(rand::random())
+    /// Create a new connection ID.
+    pub(crate) fn next() -> Self {
+        Id(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -205,9 +210,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 ConnectionState::Active(active) => {
                     self.inner = ConnectionState::Closing(active.close());
                 }
-                ConnectionState::Closing(mut inner) => match inner.poll_unpin(cx)? {
-                    Poll::Ready(()) => {
+                ConnectionState::Closing(mut inner) => match inner.poll_unpin(cx) {
+                    Poll::Ready(Ok(())) => {
                         self.inner = ConnectionState::Closed;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        log::warn!("Failure while closing connection: {e}");
+                        self.inner = ConnectionState::Closed;
+                        return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
                         self.inner = ConnectionState::Closing(inner);
@@ -216,7 +226,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 },
                 ConnectionState::Cleanup(mut cleanup) => match cleanup.poll_unpin(cx) {
                     Poll::Ready(reason) => {
-                        log::warn!("Failure while closing connection: {}", reason);
+                        log::warn!("Failure while closing connection: {reason}");
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(Ok(()));
                     }
@@ -346,8 +356,8 @@ impl<T> fmt::Display for Active<T> {
 impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     /// Create a new `Connection` from the given I/O resource.
     fn new(socket: T, cfg: Config, mode: Mode) -> Self {
-        let id = Id::random();
-        log::debug!("new connection: {} ({:?})", id, mode);
+        let id = Id::next();
+        log::debug!("new connection: {id} ({mode:?})");
         let socket = frame::Io::new(id, socket).fuse();
         Active {
             id,
@@ -610,14 +620,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 log::error!("{}: invalid stream id {}", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error());
             }
-            if frame.body().len() > DEFAULT_CREDIT as usize {
-                log::error!(
-                    "{}/{}: 1st body of stream exceeds default credit",
-                    self.id,
-                    stream_id
-                );
-                return Action::Terminate(Frame::protocol_error());
-            }
             if self.streams.contains_key(&stream_id) {
                 log::error!("{}/{}: stream already exists", self.id, stream_id);
                 return Action::Terminate(Frame::protocol_error());
@@ -626,13 +628,29 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 log::error!("{}: maximum number of streams reached", self.id);
                 return Action::Terminate(Frame::internal_error());
             }
+            if frame.body().len() > DEFAULT_CREDIT as usize {
+                log::error!(
+                    "{}/{}: 1st body of stream exceeds default credit",
+                    self.id,
+                    stream_id
+                );
+                return Action::Terminate(Frame::protocol_error());
+            }
             let stream = self.make_new_inbound_stream(stream_id, DEFAULT_CREDIT);
             {
                 let mut shared = stream.shared();
                 if is_finish {
                     shared.update_state(self.id, stream_id, State::RecvClosed);
                 }
-                shared.consume_receive_window(frame.body_len());
+                if let Err(_err) = shared.consume_receive_window(frame.body_len()) {
+                    log::error!(
+                        "{}/{}: 1st body of stream exceeds default credit",
+                        self.id,
+                        stream_id
+                    );
+
+                    return Action::Terminate(Frame::protocol_error());
+                }
                 shared.buffer.push(frame.into_body());
             }
             self.streams.insert(stream_id, stream.clone_shared());
@@ -641,18 +659,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
         if let Some(s) = self.streams.get_mut(&stream_id) {
             let mut shared = s.lock();
-            if frame.body_len() > shared.receive_window() {
+
+            if let Err(_err) = shared.consume_receive_window(frame.body_len()) {
                 log::error!(
                     "{}/{}: frame body larger than window of stream",
                     self.id,
                     stream_id
                 );
+
                 return Action::Terminate(Frame::protocol_error());
             }
+
             if is_finish {
                 shared.update_state(self.id, stream_id, State::RecvClosed);
             }
-            shared.consume_receive_window(frame.body_len());
+
             shared.buffer.push(frame.into_body());
             if let Some(w) = shared.reader.take() {
                 w.wake()
@@ -711,7 +732,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 return Action::Terminate(Frame::protocol_error());
             }
 
-            let credit = frame.header().credit() + DEFAULT_CREDIT;
+            let Some(credit) = frame.header().credit().checked_add(DEFAULT_CREDIT) else {
+                log::error!("{}: header contains invalid credit", self.id);
+                return Action::Terminate(Frame::protocol_error());
+            };
             let stream = self.make_new_inbound_stream(stream_id, credit);
 
             if is_finish {
@@ -725,9 +749,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
         if let Some(s) = self.streams.get_mut(&stream_id) {
             let mut shared = s.lock();
-            shared.increase_send_window_by(frame.header().credit());
+            if let Err(err) = shared.increase_send_window_by(frame.header().credit()) {
+                log::error!(
+                    "{}/{}: could not increase the send window, {err}",
+                    self.id,
+                    stream_id
+                );
+                return Action::Terminate(Frame::protocol_error());
+            }
             if is_finish {
                 shared.update_state(self.id, stream_id, State::RecvClosed);
+
+                if let Some(w) = shared.reader.take() {
+                    w.wake()
+                }
             }
             if let Some(w) = shared.writer.take() {
                 w.wake()
@@ -754,10 +789,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     fn on_ping(&mut self, frame: &Frame<Ping>) -> Action {
         let stream_id = frame.header().stream_id();
         if frame.header().flags().contains(header::ACK) {
-            return self.rtt.handle_pong(frame.nonce());
+            return self.rtt.handle_pong(frame.id());
         }
         if stream_id == CONNECTION_ID || self.streams.contains_key(&stream_id) {
-            let mut hdr = Header::ping(frame.header().nonce());
+            let mut hdr = Header::ping(frame.header().id());
             hdr.ack();
             return Action::Ping(Frame::new(hdr));
         }

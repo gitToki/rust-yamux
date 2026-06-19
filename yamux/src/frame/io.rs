@@ -25,7 +25,7 @@ use std::{
 /// Limits the amount of bytes a remote can cause the local node to allocate at once when reading.
 ///
 /// Chosen based on intuition in past iterations.
-const MAX_FRAME_BODY_LEN: usize = 1 * crate::MIB;
+const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 
 /// A [`Stream`] and writer of [`Frame`] values.
 #[derive(Debug)]
@@ -59,6 +59,7 @@ enum WriteState {
         buffer: Vec<u8>,
         offset: usize,
     },
+    Poisoned,
 }
 
 impl fmt::Debug for WriteState {
@@ -66,7 +67,7 @@ impl fmt::Debug for WriteState {
         match self {
             WriteState::Init => f.write_str("(WriteState::Init)"),
             WriteState::Header { offset, .. } => {
-                write!(f, "(WriteState::Header (offset {}))", offset)
+                write!(f, "(WriteState::Header (offset {offset}))")
             }
             WriteState::Body { offset, buffer } => {
                 write!(
@@ -76,6 +77,7 @@ impl fmt::Debug for WriteState {
                     buffer.len()
                 )
             }
+            WriteState::Poisoned => f.write_str("(WriteState::Poisoned)"),
         }
     }
 }
@@ -101,6 +103,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
                             return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                         }
                         *offset += n;
+
+                        if *offset > header.len() {
+                            let err = io::Error::other(format!(
+                                "Writer header returned invalid write count n={n}: {offset} > {} ",
+                                header.len(),
+                            ));
+
+                            this.write_state = WriteState::Poisoned;
+
+                            return Poll::Ready(Err(err));
+                        }
+
                         if *offset == header.len() {
                             if !buffer.is_empty() {
                                 let buffer = std::mem::take(buffer);
@@ -122,11 +136,28 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
                             return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                         }
                         *offset += n;
+
+                        if *offset > buffer.len() {
+                            let err = io::Error::other(format!(
+                                "Writer body returned invalid write count n={n}: {offset} > {} ",
+                                buffer.len(),
+                            ));
+
+                            this.write_state = WriteState::Poisoned;
+
+                            return Poll::Ready(Err(err));
+                        }
+
                         if *offset == buffer.len() {
                             this.write_state = WriteState::Init;
                         }
                     }
                 },
+                WriteState::Poisoned => {
+                    return Poll::Ready(Err(io::Error::other(
+                        "Sink is in poisoned state due to previous write error",
+                    )))
+                }
             }
         }
     }
@@ -265,7 +296,7 @@ impl fmt::Debug for ReadState {
         match self {
             ReadState::Init => f.write_str("(ReadState::Init)"),
             ReadState::Header { offset, .. } => {
-                write!(f, "(ReadState::Header (offset {}))", offset)
+                write!(f, "(ReadState::Header (offset {offset}))")
             }
             ReadState::Body {
                 header,
@@ -299,9 +330,9 @@ pub enum FrameDecodeError {
 impl std::fmt::Display for FrameDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            FrameDecodeError::Io(e) => write!(f, "i/o error: {}", e),
-            FrameDecodeError::Header(e) => write!(f, "decode error: {}", e),
-            FrameDecodeError::FrameTooLarge(n) => write!(f, "frame body is too large ({})", n),
+            FrameDecodeError::Io(e) => write!(f, "i/o error: {e}"),
+            FrameDecodeError::Header(e) => write!(f, "decode error: {e}"),
+            FrameDecodeError::FrameTooLarge(n) => write!(f, "frame body is too large ({n})"),
         }
     }
 }
@@ -340,7 +371,7 @@ mod tests {
             let body = if header.tag() == header::Tag::Data {
                 header.set_len(header.len().val() % 4096);
                 let mut b = vec![0; header.len().val() as usize];
-                rand::thread_rng().fill_bytes(&mut b);
+                rand::rng().fill_bytes(&mut b);
                 b
             } else {
                 Vec::new()
@@ -353,7 +384,7 @@ mod tests {
     fn encode_decode_identity() {
         fn property(f: Frame<()>) -> bool {
             futures::executor::block_on(async move {
-                let id = crate::connection::Id::random();
+                let id = crate::connection::Id::next();
                 let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()));
                 if io.send(f.clone()).await.is_err() {
                     return false;

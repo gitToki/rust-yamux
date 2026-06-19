@@ -10,15 +10,21 @@
 
 //! Connection round-trip time measurement
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
-use instant::{Duration, Instant};
 use parking_lot::Mutex;
+use web_time::{Duration, Instant};
 
 use crate::connection::Action;
 use crate::frame::{header::Ping, Frame};
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Next ping identifier, used for matching pongs.
+static NEXT_PING: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone, Debug)]
 pub(crate) struct Rtt(Arc<Mutex<RttInner>>);
@@ -45,40 +51,40 @@ impl Rtt {
             }
         }
 
-        let nonce = rand::random();
+        let id = NEXT_PING.fetch_add(1, Ordering::Relaxed);
         *state = RttState::AwaitingPong {
             sent_at: Instant::now(),
-            nonce,
+            id,
         };
-        log::debug!("sending ping {nonce}");
-        Some(Frame::ping(nonce))
+        log::debug!("sending ping {id}");
+        Some(Frame::ping(id))
     }
 
-    pub(crate) fn handle_pong(&mut self, received_nonce: u32) -> Action {
+    pub(crate) fn handle_pong(&mut self, received_id: u32) -> Action {
         let inner = &mut self.0.lock();
 
-        let (sent_at, expected_nonce) = match inner.state {
+        let (sent_at, expected_id) = match inner.state {
             RttState::Waiting { .. } => {
-                log::error!("received unexpected pong {received_nonce}");
+                log::error!("received unexpected pong {received_id}");
                 return Action::Terminate(Frame::protocol_error());
             }
-            RttState::AwaitingPong { sent_at, nonce } => (sent_at, nonce),
+            RttState::AwaitingPong { sent_at, id } => (sent_at, id),
         };
 
-        if received_nonce != expected_nonce {
-            log::error!("received pong with {received_nonce} but expected {expected_nonce}");
+        if received_id != expected_id {
+            log::error!("received pong with {received_id} but expected {expected_id}");
             return Action::Terminate(Frame::protocol_error());
         }
 
         let rtt = sent_at.elapsed();
         inner.rtt = Some(rtt);
-        log::debug!("received pong {received_nonce}, estimated round-trip-time {rtt:?}");
+        log::debug!("received pong {received_id}, estimated round-trip-time {rtt:?}");
 
         inner.state = RttState::Waiting {
             next: Instant::now() + PING_INTERVAL,
         };
 
-        return Action::None;
+        Action::None
     }
 
     pub(crate) fn get(&self) -> Option<Duration> {
@@ -117,7 +123,7 @@ impl quickcheck::Arbitrary for RttInner {
 #[derive(Debug)]
 #[cfg_attr(test, derive(Clone))]
 enum RttState {
-    AwaitingPong { sent_at: Instant, nonce: u32 },
+    AwaitingPong { sent_at: Instant, id: u32 },
     Waiting { next: Instant },
 }
 
@@ -127,7 +133,7 @@ impl quickcheck::Arbitrary for RttState {
         if bool::arbitrary(g) {
             RttState::AwaitingPong {
                 sent_at: Instant::now(),
-                nonce: u32::arbitrary(g),
+                id: u32::arbitrary(g),
             }
         } else {
             RttState::Waiting {

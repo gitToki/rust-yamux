@@ -166,19 +166,19 @@ impl Header<WindowUpdate> {
 
 impl Header<Ping> {
     /// Create a new ping frame header.
-    pub fn ping(nonce: u32) -> Self {
+    pub fn ping(id: u32) -> Self {
         Header {
             version: Version(0),
             tag: Tag::Ping,
             flags: Flags(0),
             stream_id: StreamId(0),
-            length: Len(nonce),
+            length: Len(id),
             _marker: std::marker::PhantomData,
         }
     }
 
-    /// The nonce of this ping.
-    pub fn nonce(&self) -> u32 {
+    /// The id of this ping.
+    pub fn id(&self) -> u32 {
         self.length.0
     }
 }
@@ -297,6 +297,8 @@ impl StreamId {
         StreamId(val)
     }
 
+    // TODO: remove and use is multiple_of() on the next minor release.
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn is_server(self) -> bool {
         self.0 % 2 == 0
     }
@@ -399,8 +401,8 @@ pub enum HeaderDecodeError {
 impl std::fmt::Display for HeaderDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            HeaderDecodeError::Version(v) => write!(f, "unknown version: {}", v),
-            HeaderDecodeError::Type(t) => write!(f, "unknown frame type: {}", t),
+            HeaderDecodeError::Version(v) => write!(f, "unknown version: {v}"),
+            HeaderDecodeError::Type(t) => write!(f, "unknown frame type: {t}"),
         }
     }
 }
@@ -435,7 +437,7 @@ mod tests {
             match decode(&encode(&hdr)) {
                 Ok(x) => x == hdr,
                 Err(e) => {
-                    eprintln!("decode error: {}", e);
+                    eprintln!("decode error: {e}");
                     false
                 }
             }
